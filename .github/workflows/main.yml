@@ -1,0 +1,138 @@
+name: Build Doom UF2 (Waveshare Pico-LCD-1.3)
+
+# Builds ONE drag-and-drop UF2 for a Raspberry Pi Pico (RP2040) + Waveshare Pico-LCD-1.3.
+# Output: 1_game_data.uf2 (flash this first) and 2_program.uf2 (flash this second).
+# DOOM_LCD_single_file.uf2 is the same thing as one file, in case you prefer that.
+#
+# Run it from the "Actions" tab -> "Build Doom UF2" -> "Run workflow" (you can pick options there),
+# or it runs by itself every time you push to the repository.
+# Download the result from the bottom of the finished run: Artifacts -> doom-waveshare-lcd.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      view_mode:
+        description: 'Picture shape on the 240x240 screen'
+        type: choice
+        default: fit
+        options:
+          - fit   # 240x180, correct 4:3 shape, black bars top and bottom
+          - fill  # 240x240, stretched to fill the whole screen
+      madctl:
+        description: 'Screen orientation (0x70 = normal, 0xA0 = upside down)'
+        type: string
+        default: '0x70'
+      always_run:
+        description: 'Always run (no need to hold a run button)'
+        type: boolean
+        default: true
+      spi_mhz:
+        description: 'Max screen SPI speed in MHz (lower it, e.g. 25, if the picture is glitchy)'
+        type: string
+        default: '40'
+
+permissions:
+  contents: write   # only used to attach the UF2 to a release when you push a v* tag
+
+env:
+  PICO_SDK_TAG: 2.1.1
+  PICO_EXTRAS_TAG: sdk-2.1.1
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install the ARM toolchain and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build python3 git build-essential pkg-config libusb-1.0-0-dev \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
+          arm-none-eabi-gcc --version | head -1
+
+      - name: Get the Pico SDK and pico-extras
+        run: |
+          git clone --depth 1 --branch "$PICO_SDK_TAG" https://github.com/raspberrypi/pico-sdk.git "$HOME/pico-sdk"
+          git clone --depth 1 --branch "$PICO_EXTRAS_TAG" https://github.com/raspberrypi/pico-extras.git "$HOME/pico-extras"
+          git -C "$HOME/pico-sdk" submodule update --init --depth 1 lib/tinyusb
+
+      - name: Work out the build options
+        id: opts
+        env:
+          IN_VIEW: ${{ inputs.view_mode }}
+          IN_MADCTL: ${{ inputs.madctl }}
+          IN_RUN: ${{ inputs.always_run }}
+          IN_SPI: ${{ inputs.spi_mhz }}
+        run: |
+          view="${IN_VIEW:-fit}"
+          madctl="${IN_MADCTL:-0x70}"
+          run="${IN_RUN:-true}"
+          spi="${IN_SPI:-40}"
+          [[ "$spi" =~ ^[0-9]{1,2}$ ]] && [ "$spi" -ge 5 ] && [ "$spi" -le 62 ] || { echo "spi_mhz must be a number from 5 to 62"; exit 1; }
+          [[ "$madctl" =~ ^0x[0-9A-Fa-f]{1,2}$ ]] || { echo "madctl must look like 0x70"; exit 1; }
+          flags="-DLCD_MADCTL=$madctl -DLCD_SPI_MAX_HZ=${spi}000000"
+          [ "$view" = "fill" ] && flags="$flags -DLCD_VIEW_MODE=1"
+          [ "$run" = "false" ] && flags="$flags -DLCD_ALWAYS_RUN=0"
+          echo "flags=$flags" >> "$GITHUB_OUTPUT"
+          echo "Build options: $flags"
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DPICO_BOARD=pico \
+            -DPICO_SDK_PATH="$HOME/pico-sdk" \
+            -DPICO_EXTRAS_PATH="$HOME/pico-extras" \
+            ${{ steps.opts.outputs.flags }}
+
+      - name: Build
+        run: cmake --build build --target doom_tiny
+
+      - name: Make the UF2 files (two-step pair, plus one combined file)
+        run: |
+          mkdir -p out
+          # the combined single file (some PCs/Picos choke on a file this big)
+          python3 tools/make_uf2.py build/src/doom_tiny.uf2 doom1.whx out/DOOM_LCD_single_file.uf2
+          # the two-step pair: flash 1 first, then 2
+          python3 - <<'PY'
+          import importlib.util, struct
+          spec = importlib.util.spec_from_file_location("m", "tools/make_uf2.py")
+          m = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(m)
+
+          def write(path, blocks):
+              with open(path, "wb") as f:
+                  for n, (flags, addr, size, fam, pl) in enumerate(blocks):
+                      f.write(struct.pack("<8I", m.MAGIC0, m.MAGIC1, flags, addr, size, n, len(blocks), fam)
+                              + pl.ljust(476, b"\0") + struct.pack("<I", m.MAGIC_END))
+
+          write("out/1_game_data.uf2", m.bin_to_blocks("doom1.whx", 0x10040000))
+          write("out/2_program.uf2", m.read_blocks("build/src/doom_tiny.uf2"))
+          PY
+          cp build/src/doom_tiny.elf out/doom_tiny.elf
+          ls -l out
+
+      - name: Upload the UF2 files
+        uses: actions/upload-artifact@v4
+        with:
+          name: doom-waveshare-lcd
+          path: |
+            out/1_game_data.uf2
+            out/2_program.uf2
+            out/DOOM_LCD_single_file.uf2
+            out/doom_tiny.elf
+
+      - name: Attach to the release (only when you push a v* tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/1_game_data.uf2
+            out/2_program.uf2
